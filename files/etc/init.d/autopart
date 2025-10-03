@@ -1,19 +1,17 @@
 #!/bin/sh /etc/rc.common
-# 自动把 TF 卡做成：p1=20GB (overlay)，p2=ext4(余量，挂 /mnt/docker)，并把 Docker data-root 指到 /mnt/docker
+# 首启：在 sysupgrade/squashfs 场景下：
+# - 新建 p3=20G ext4 → 作为 extroot（/overlay）
+# - 新建 p4=余量 ext4 → /mnt/docker，并将 Docker data-root 指向该目录
 START=99
 USE_PROCD=1
-
 FLAG="/etc/.autopart_done"
 
-find_root_disk() {
-  # 优先找根（/）所在分区，其次找 overlay
-  local src
-  src="$(findmnt -n -o SOURCE / 2>/dev/null)"
-  [ -z "$src" ] && src="$(findmnt -n -o SOURCE /overlay 2>/dev/null)"
+find_boot_disk() {
+  local src; src="$(findmnt -n -o SOURCE /rom 2>/dev/null)"
+  [ -z "$src" ] && src="$(findmnt -n -o SOURCE / 2>/dev/null)"
   echo "$src"
 }
 
-# 去掉分区号，得到整盘设备名（兼容 /dev/mmcblk0p1 与 /dev/sda1）
 base_disk_of() {
   local part="$1"
   case "$part" in
@@ -27,80 +25,75 @@ base_disk_of() {
 start() {
   [ -f "$FLAG" ] && exit 0
 
-  # 仅在 ext4/sdcard 场景执行（squashfs/sysupgrade 不做此操作）
-  grep -q "rootfs_data" /proc/mounts && {
-    # squashfs 场景通常 rootfs 不在 ext4 完整盘镜像上，跳过
-    exit 0
-  }
+  # 仅在 squashfs/sysupgrade 场景运行
+  mount | grep -q " on /rom " || exit 0
 
-  ROOT_PART="$(find_root_disk)"
-  [ -z "$ROOT_PART" ] && exit 0
-
-  DISK="$(base_disk_of "$ROOT_PART")"
+  BOOT_PART="$(find_boot_disk)"
+  [ -z "$BOOT_PART" ] && exit 0
+  DISK="$(base_disk_of "$BOOT_PART")"
   [ -b "$DISK" ] || exit 0
 
-  # 仅处理常见 TF/SD 场景（mmcblk*/sd*），避免误操作 U 盘/外接盘
   case "$DISK" in
     /dev/mmcblk*|/dev/sd*) ;;
     *) exit 0 ;;
   esac
 
-  # 目标容量（MB）
-  OVERLAY_MB=20480   # 20 GB 给 p1
-  # p2 占剩余空间；若你想固定 40GB，也可改成 DOCKER_MB=40960 并按需计算结束扇区
+  EXTROOT_MB=20480
 
-  # 同步分区表
+  P2="${DISK}p2"; [ -b "$P2" ] || P2="${DISK}2"
+  END_SECTOR="$(cat /sys/class/block/$(basename "$P2")/size 2>/dev/null)"
+  START_SECTOR_P2="$(cat /sys/class/block/$(basename "$P2")/start 2>/dev/null)"
+  DISK_SECTOR_SIZE="$(cat /sys/class/block/$(basename "$DISK")/queue/hw_sector_size 2>/dev/null)"
+  [ -z "$DISK_SECTOR_SIZE" ] && DISK_SECTOR_SIZE=512
+  [ -z "$START_SECTOR_P2" ] && exit 0
+
+  LAST_END=$(( START_SECTOR_P2 + END_SECTOR - 1 ))
+  EXTROOT_SECTORS=$(( (EXTROOT_MB * 1024 * 1024 + DISK_SECTOR_SIZE - 1) / DISK_SECTOR_SIZE ))
+  P3_START=$(( LAST_END + 1 ))
+  P3_END=$(( P3_START + EXTROOT_SECTORS - 1 ))
+  P4_START=$(( P3_END + 1 ))
+
   partprobe "$DISK" 2>/dev/null
-
-  # 取 p1（根分区）起始扇区
-  P1="${DISK}p1"
-  [ -b "$P1" ] || P1="${DISK}1"
-  [ -b "$P1" ] || exit 0
-
-  START_SECTOR="$(cat /sys/class/block/$(basename "$P1")/start 2>/dev/null)"
-  SECTOR_SIZE="$(cat /sys/class/block/$(basename "$DISK")/queue/hw_sector_size 2>/dev/null)"
-  [ -z "$SECTOR_SIZE" ] && SECTOR_SIZE=512
-  [ -z "$START_SECTOR" ] && exit 0
-
-  P1_SIZE_BYTES=$((OVERLAY_MB * 1024 * 1024))
-  P1_SECTORS=$(( (P1_SIZE_BYTES + SECTOR_SIZE - 1) / SECTOR_SIZE ))
-  P1_END=$(( START_SECTOR + P1_SECTORS - 1 ))
-
-  # 执行分区调整：把 p1 扩到 20GB，并把其后的空闲做成 p2
   parted -s "$DISK" unit s \
     "print" \
-    "resizepart 1 ${P1_END}s" \
-    "mkpart primary ext4 ${P1_END}s 100%" || exit 0
+    "mkpart primary ext4 ${P3_START}s ${P3_END}s" \
+    "mkpart primary ext4 ${P4_START}s 100%" || exit 0
 
-  # 重新读分区表
   partprobe "$DISK"
   sleep 2
 
-  # 扩容 p1 的 ext4
-  e2fsck -pf "$P1"
-  resize2fs "$P1"
+  P3="${DISK}p3"; [ -b "$P3" ] || P3="${DISK}3"
+  P4="${DISK}p4"; [ -b "$P4" ] || P4="${DISK}4"
+  [ -b "$P3" ] || exit 0
+  [ -b "$P4" ] || exit 0
 
-  # 格式化 p2 -> ext4，打标签 DOCKER
-  P2="${DISK}p2"
-  [ -b "$P2" ] || P2="${DISK}2"
-  [ -b "$P2" ] || exit 0
+  mkfs.ext4 -F -L EXTROOT "$P3"
+  mkfs.ext4 -F -L DOCKER  "$P4"
 
-  mkfs.ext4 -F -L DOCKER "$P2"
+  # 配置 extroot (/overlay)
+  uci -q delete fstab
+  uci set fstab.@global[0].anon_mount='1'
+  uci add fstab mount
+  uci set fstab.@mount[-1].enabled='1'
+  uci set fstab.@mount[-1].device='LABEL=EXTROOT'
+  uci set fstab.@mount[-1].target='/overlay'
+  uci set fstab.@mount[-1].fstype='ext4'
+  uci set fstab.@mount[-1].options='rw,sync'
+  uci set fstab.@mount[-1].is_rootfs='1'
 
-  # 生成 fstab（更符合 OpenWrt 习惯：写 /etc/config/fstab）
-  uci -q delete fstab.@mount[0] >/dev/null 2>&1  # 保留原有条目也行，这里不强制删除
-  # 新增 docker 分区挂载
-  uci add fstab mount >/dev/null
+  # 配置 Docker 分区 (/mnt/docker)
+  uci add fstab mount
   uci set fstab.@mount[-1].enabled='1'
   uci set fstab.@mount[-1].device='LABEL=DOCKER'
   uci set fstab.@mount[-1].target='/mnt/docker'
   uci set fstab.@mount[-1].fstype='ext4'
   uci set fstab.@mount[-1].options='defaults'
+
   uci commit fstab
   /etc/init.d/fstab enable
   /etc/init.d/fstab restart
 
-  # Docker data-root 指向 /mnt/docker
+  # 写 Docker 默认目录
   mkdir -p /etc/docker
   cat > /etc/docker/daemon.json <<'EOF'
 {
