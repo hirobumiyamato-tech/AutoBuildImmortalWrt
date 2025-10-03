@@ -25,8 +25,8 @@ base_disk_of() {
 start() {
   [ -f "$FLAG" ] && exit 0
 
-  # 仅在 squashfs/sysupgrade 场景运行
-  mount | grep -q " on /rom " || exit 0
+  # 仅在 ext4/sysupgrade 场景运行；如果检测到 /rom（squashfs），就跳过
+  mount | grep -q " on /rom " && exit 0
 
   BOOT_PART="$(find_boot_disk)"
   [ -z "$BOOT_PART" ] && exit 0
