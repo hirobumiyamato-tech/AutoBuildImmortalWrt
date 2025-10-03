@@ -46,3 +46,21 @@ add_pkg luci-app-turboacc
 # 输出日志（可选）
 echo "[custom-packages] FINAL CUSTOM_PACKAGES = ${CUSTOM_PACKAGES}"
 export CUSTOM_PACKAGES
+# 必备分区/文件系统/挂载工具（extroot 首启脚本需要）
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES parted fdisk e2fsprogs resize2fs kmod-fs-ext4 block-mount"
+
+# 你选择要预装的 6 个插件
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES \
+  luci-i18n-quickstart-zh-cn \
+  luci-app-adguardhome \
+  luci-app-openclash \
+  luci-app-tailscale luci-i18n-tailscale-zh-cn \
+  luci-app-netspeedtest luci-i18n-netspeedtest-zh-cn \
+  luci-app-turboacc"
+
+# OpenClash 运行常用依赖（推荐一起打包，避免运行期再装）
+CUSTOM_PACKAGES="$CUSTOM_PACKAGES \
+  bash coreutils coreutils-nohup curl ca-bundle ca-certificates \
+  ip-full ipset iptables-nft nftables luci-compat \
+  kmod-tun kmod-nft-tproxy kmod-nft-socket kmod-inet-diag \
+  unzip tar openssl-util"
