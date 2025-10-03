@@ -77,8 +77,8 @@ on:
         default: 'no'
         type: choice
         options:
-        - 'yes'
-        - 'no'
+          - 'yes'
+          - 'no'
       pppoe_account:
         description: "宽带账号 (若启用PPPoE)"
         required: false
@@ -97,15 +97,14 @@ jobs:
       - name: Set executable permissions for repo scripts
         run: chmod +x ${{ github.workspace }}/rockchip/build24.sh || true
 
-      # ✅ 追加必须的系统工具与可选 docker 到自定义包；这样 ImageBuilder 会打进固件
+      # 追加必须的系统工具与可选 docker 到自定义包
       - name: Ensure required packages & optional store/docker
         shell: bash
         run: |
-          # 确保自定义包脚本存在
           mkdir -p shell
           touch shell/custom-packages.sh
 
-          # 必备：分区 & FS 工具 + 挂载
+          # 必备：分区 & FS 工具 + 挂载（首启分区用）
           if ! grep -q 'parted' shell/custom-packages.sh 2>/dev/null; then
             echo 'CUSTOM_PACKAGES="$CUSTOM_PACKAGES parted fdisk e2fsprogs resize2fs kmod-fs-ext4 block-mount"' >> shell/custom-packages.sh
           fi
@@ -120,7 +119,7 @@ jobs:
             echo "❎ 未启用 luci-app-store"
           fi
 
-          # 可选：Docker（这里兜底追加；原 build.sh 若已处理不会冲突）
+          # 可选：Docker（兜底追加；原 build.sh 若已处理不会冲突）
           if [ "${{ github.event.inputs.include_docker }}" == "yes" ]; then
             if ! grep -q 'dockerd' shell/custom-packages.sh 2>/dev/null; then
               echo 'CUSTOM_PACKAGES="$CUSTOM_PACKAGES dockerd docker luci-app-dockerman"' >> shell/custom-packages.sh
@@ -130,18 +129,17 @@ jobs:
             echo "❎ 未启用 Docker"
           fi
 
-      # ✅ 保障 .config 至少打开 ext4-sdcard 与 gzip；其余仍由项目现有配置控制
+      # （对 ImageBuilder 影响不大，但保留兜底）
       - name: Patch .config defaults (ext4 + gzip)
         run: |
-          # 基础配置文件在 rockchip/imm.config 挂进容器，这里先补充兜底项
           echo 'CONFIG_TARGET_ROOTFS_EXT4FS=y' >> rockchip/imm.config
           echo 'CONFIG_TARGET_IMAGES_GZIP=y'   >> rockchip/imm.config
 
-      # ✅ 关键：确保 autopart 脚本是可执行的（你是网页端创建，默认 644）
+      # ✅ 关键：确保 autopart 脚本可执行（网页创建默认 644）
       - name: Ensure autopart executable
         run: |
           mkdir -p files/etc/init.d
-          chmod +x files/etc/init.d/autopart
+          if [ -f files/etc/init.d/autopart ]; then chmod +x files/etc/init.d/autopart; else echo "WARN: files/etc/init.d/autopart not found"; fi
 
       - name: Validate PPPoE Inputs
         run: |
@@ -167,7 +165,7 @@ jobs:
               --user root \
               -v "${{ github.workspace }}/bin:/home/build/immortalwrt/bin" \
               -v "${{ github.workspace }}/files/etc/uci-defaults:/home/build/immortalwrt/files/etc/uci-defaults" \
-              -v "${{ github.workspace }}/files/etc/init.d:/home/build/immortalwrt/files/etc/init.d" \  # ← 新增挂载，打包 autopart
+              -v "${{ github.workspace }}/files/etc/init.d:/home/build/immortalwrt/files/etc/init.d" \
               -v "${{ github.workspace }}/arch/arch.conf:/home/build/immortalwrt/files/etc/opkg/arch.conf" \
               -v "${{ github.workspace }}/rockchip/imm.config:/home/build/immortalwrt/.config" \
               -v "${{ github.workspace }}/shell:/home/build/immortalwrt/shell" \
