@@ -1,12 +1,12 @@
 #!/bin/sh /etc/rc.common
-# 首启：在 sysupgrade/squashfs 场景下：
-# - 新建 p3=20G ext4 → 作为 extroot（/overlay）
-# - 新建 p4=余量 ext4 → /mnt/docker，并将 Docker data-root 指向该目录
+# 首启：创建 p3=20G(ext4, EXTROOT -> /overlay)、p4=全盘余量(ext4, DOCKER -> /mnt/docker)
+# 幂等：若已存在 LABEL=EXTROOT 或已打标记文件，则不重复执行
 START=99
 USE_PROCD=1
 FLAG="/etc/.autopart_done"
 
 find_boot_disk() {
+  # 优先找 /rom，其次 /
   local src; src="$(findmnt -n -o SOURCE /rom 2>/dev/null)"
   [ -z "$src" ] && src="$(findmnt -n -o SOURCE / 2>/dev/null)"
   echo "$src"
@@ -23,10 +23,15 @@ base_disk_of() {
 }
 
 start() {
+  # 已做过就退出
   [ -f "$FLAG" ] && exit 0
 
-  # 仅在 ext4/sysupgrade 场景运行；如果检测到 /rom（squashfs），就跳过
-  mount | grep -q " on /rom " && exit 0
+  # 若已存在 EXTROOT 标签，也认为做过
+  blkid | grep -q 'LABEL="EXTROOT"' && exit 0
+
+  # 基础工具检查
+  command -v parted >/dev/null 2>&1 || exit 0
+  command -v mkfs.ext4 >/dev/null 2>&1 || exit 0
 
   BOOT_PART="$(find_boot_disk)"
   [ -z "$BOOT_PART" ] && exit 0
@@ -38,21 +43,25 @@ start() {
     *) exit 0 ;;
   esac
 
-  EXTROOT_MB=20480
+  EXTROOT_MB=20480  # 20GB
 
+  # 以 p2 为参考，紧挨着 p2 之后创建 p3/p4
   P2="${DISK}p2"; [ -b "$P2" ] || P2="${DISK}2"
+  [ -b "$P2" ] || exit 0
+
   END_SECTOR="$(cat /sys/class/block/$(basename "$P2")/size 2>/dev/null)"
   START_SECTOR_P2="$(cat /sys/class/block/$(basename "$P2")/start 2>/dev/null)"
-  DISK_SECTOR_SIZE="$(cat /sys/class/block/$(basename "$DISK")/queue/hw_sector_size 2>/dev/null)"
-  [ -z "$DISK_SECTOR_SIZE" ] && DISK_SECTOR_SIZE=512
+  SECTOR_SIZE="$(cat /sys/class/block/$(basename "$DISK")/queue/hw_sector_size 2>/dev/null)"
+  [ -z "$SECTOR_SIZE" ] && SECTOR_SIZE=512
   [ -z "$START_SECTOR_P2" ] && exit 0
 
   LAST_END=$(( START_SECTOR_P2 + END_SECTOR - 1 ))
-  EXTROOT_SECTORS=$(( (EXTROOT_MB * 1024 * 1024 + DISK_SECTOR_SIZE - 1) / DISK_SECTOR_SIZE ))
+  P3_SECTORS=$(( (EXTROOT_MB * 1024 * 1024 + SECTOR_SIZE - 1) / SECTOR_SIZE ))
   P3_START=$(( LAST_END + 1 ))
-  P3_END=$(( P3_START + EXTROOT_SECTORS - 1 ))
+  P3_END=$(( P3_START + P3_SECTORS - 1 ))
   P4_START=$(( P3_END + 1 ))
 
+  # 写分区表
   partprobe "$DISK" 2>/dev/null
   parted -s "$DISK" unit s \
     "print" \
@@ -67,39 +76,39 @@ start() {
   [ -b "$P3" ] || exit 0
   [ -b "$P4" ] || exit 0
 
+  # 格式化并打标签
   mkfs.ext4 -F -L EXTROOT "$P3"
   mkfs.ext4 -F -L DOCKER  "$P4"
 
-  # 配置 extroot (/overlay)
-  uci -q delete fstab
-  uci set fstab.@global[0].anon_mount='1'
-  uci add fstab mount
-  uci set fstab.@mount[-1].enabled='1'
-  uci set fstab.@mount[-1].device='LABEL=EXTROOT'
-  uci set fstab.@mount[-1].target='/overlay'
-  uci set fstab.@mount[-1].fstype='ext4'
-  uci set fstab.@mount[-1].options='rw,sync'
-  uci set fstab.@mount[-1].is_rootfs='1'
+  # 写 /etc/config/fstab：EXTROOT -> /overlay、DOCKER -> /mnt/docker
+  # 不粗暴删除全 fstab，仅追加我们需要的两条
+  uci -q batch <<-EOF
+    add fstab mount
+    set fstab.@mount[-1].enabled='1'
+    set fstab.@mount[-1].device='LABEL=EXTROOT'
+    set fstab.@mount[-1].target='/overlay'
+    set fstab.@mount[-1].fstype='ext4'
+    set fstab.@mount[-1].options='rw,sync'
+    set fstab.@mount[-1].is_rootfs='1'
 
-  # 配置 Docker 分区 (/mnt/docker)
-  uci add fstab mount
-  uci set fstab.@mount[-1].enabled='1'
-  uci set fstab.@mount[-1].device='LABEL=DOCKER'
-  uci set fstab.@mount[-1].target='/mnt/docker'
-  uci set fstab.@mount[-1].fstype='ext4'
-  uci set fstab.@mount[-1].options='defaults'
-
+    add fstab mount
+    set fstab.@mount[-1].enabled='1'
+    set fstab.@mount[-1].device='LABEL=DOCKER'
+    set fstab.@mount[-1].target='/mnt/docker'
+    set fstab.@mount[-1].fstype='ext4'
+    set fstab.@mount[-1].options='defaults'
+  EOF
   uci commit fstab
   /etc/init.d/fstab enable
   /etc/init.d/fstab restart
 
-  # 写 Docker 默认目录
+  # Docker data-root
   mkdir -p /etc/docker
-  cat > /etc/docker/daemon.json <<'EOF'
+  cat > /etc/docker/daemon.json <<'JSON'
 {
   "data-root": "/mnt/docker"
 }
-EOF
+JSON
 
   touch "$FLAG"
   sync
