@@ -1,5 +1,5 @@
 #!/bin/sh
-# 使 autopart 在首次引导时启用并立即执行一次
+# 使 autopart 在首启时启用并立即执行一次
 [ -x /etc/init.d/autopart ] && {
   /etc/init.d/autopart enable
   /etc/init.d/autopart start
