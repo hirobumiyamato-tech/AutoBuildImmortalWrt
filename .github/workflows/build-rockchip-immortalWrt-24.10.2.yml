@@ -97,11 +97,21 @@ jobs:
       - name: Set executable permissions for repo scripts
         run: chmod +x ${{ github.workspace }}/rockchip/build24.sh || true
 
-      # ✅ 保障 autopart 可执行（防止网页端新建时默认 644）
-      - name: Ensure autopart executable
+      # ✅ 确保 autopart 存在 + 设置为 755
+      - name: Ensure autopart installed & permission fixed
         run: |
           mkdir -p files/etc/init.d
-          if [ -f files/etc/init.d/autopart ]; then chmod +x files/etc/init.d/autopart; else echo "WARN: files/etc/init.d/autopart not found"; fi
+          # 如果仓库里有 autopart.txt，就复制并设置权限
+          if [ -f autopart.txt ]; then
+            install -D -m 0755 autopart.txt files/etc/init.d/autopart
+          fi
+          # 如果已经存在 autopart 文件，就再兜底改一次权限
+          if [ -f files/etc/init.d/autopart ]; then
+            chmod 755 files/etc/init.d/autopart
+          fi
+          # 打印权限确认
+          ls -l files/etc/init.d/autopart
+          stat -c "%a %n" files/etc/init.d/autopart
 
       # ✅ 追加必须的系统工具与可选 docker/store 包
       - name: Ensure required packages & optional store/docker
