@@ -1,117 +1,128 @@
 #!/bin/sh /etc/rc.common
-# 首启：创建 p3=20G(ext4, EXTROOT -> /overlay)、p4=余量(ext4, DOCKER -> /mnt/docker)
-# 幂等：若已存在 EXTROOT 分区或标记文件，则不重复执行
-START=99
-USE_PROCD=1
-FLAG="/etc/.autopart_done"
+# 自动分区 + 格式化 + fstab + 挂载 + Docker data-root
+# 适配 NanoPi R4S (mmcblk1: p1/p2 已存在，p3=EXTROOT ext4，p4=DOCKER ext4)
+# 可通过环境变量覆盖：P3_SIZE_MIB(默认8192)、DEV(默认/dev/mmcblk1)
 
-find_boot_disk() {
-  local src; src="$(findmnt -n -o SOURCE /rom 2>/dev/null)"
-  [ -z "$src" ] && src="$(findmnt -n -o SOURCE / 2>/dev/null)"
-  echo "$src"
-}
-
-base_disk_of() {
-  local part="$1"
-  case "$part" in
-    *mmcblk*p[0-9]*) echo "${part%p[0-9]*}";;
-    *nvme*n*p[0-9]*) echo "${part%p[0-9]*}";;
-    *[0-9])          echo "${part%[0-9]}";;
-    *)               echo "$part";;
-  esac
-}
+START=15
+USE_PROCD=0
 
 start() {
-  # 已完成就退出
-  [ -f "$FLAG" ] && exit 0
-  blkid | grep -q 'LABEL="EXTROOT"' && exit 0
+  exec >/root/autopart.log 2>&1
+  set -euxo pipefail
+  logger -t autopart "start"
 
-  # 必须要有 parted 和 mkfs.ext4
-  command -v parted >/dev/null 2>&1 || exit 0
-  command -v mkfs.ext4 >/dev/null 2>&1 || exit 0
+  DEV="${DEV:-/dev/mmcblk1}"
+  P3_SIZE_MIB="${P3_SIZE_MIB:-8192}"    # p3 分区大小，默认 8GiB；其余给 p4
 
-  BOOT_PART="$(find_boot_disk)"
-  [ -z "$BOOT_PART" ] && exit 0
-  DISK="$(base_disk_of "$BOOT_PART")"
-  [ -b "$DISK" ] || exit 0
+  require_bin() { command -v "$1" >/dev/null 2>&1 || { logger -t autopart "missing $1"; exit 1; }; }
+  for b in parted awk grep sed cut tr lsblk mkfs.ext4 block uci; do require_bin "$b"; done
 
-  case "$DISK" in
-    /dev/mmcblk*|/dev/sd*) ;;
-    *) exit 0 ;;
-  esac
+  # 如果已是 extroot，或 /mnt/docker 已挂载，直接跳过（幂等）
+  if mountpoint -q /overlay; then
+    MNT_DEV="$(awk '$2=="/overlay"{print $1}' /proc/mounts || true)"
+    logger -t autopart "overlay is ${MNT_DEV}, skip partitioning"
+  fi
+  if mountpoint -q /mnt/docker; then
+    logger -t autopart "/mnt/docker already mounted, skip"
+  fi
 
-  EXTROOT_MB=20480  # 20GB
+  # 读取当前分区表，拿到 p2 的结尾，作为 p3 起点
+  # 仅当 p3/p4 不存在时才创建
+  lsblk -lno NAME "${DEV}" || true
+  HAVE_P3=0; HAVE_P4=0
+  [ -b "${DEV}p3" ] && HAVE_P3=1
+  [ -b "${DEV}p4" ] && HAVE_P4=1
 
-  # 找到 p2 作为参考
-  P2="${DISK}p2"; [ -b "$P2" ] || P2="${DISK}2"
-  [ -b "$P2" ] || exit 0
+  if [ "${HAVE_P3}" -eq 0 ] || [ "${HAVE_P4}" -eq 0 ]; then
+    logger -t autopart "create p3/p4 on ${DEV}"
 
-  END_SECTOR="$(cat /sys/class/block/$(basename "$P2")/size 2>/dev/null)"
-  START_SECTOR_P2="$(cat /sys/class/block/$(basename "$P2")/start 2>/dev/null)"
-  SECTOR_SIZE="$(cat /sys/class/block/$(basename "$DISK")/queue/hw_sector_size 2>/dev/null)"
-  [ -z "$SECTOR_SIZE" ] && SECTOR_SIZE=512
-  [ -z "$START_SECTOR_P2" ] && exit 0
+    # p2 结束位置 (MiB)
+    P2_END_MIB="$(
+      parted -s -m "${DEV}" unit MiB print | awk -F: '
+        $1 ~ /^[0-9]+$/ && $1==2 { gsub("MiB","",$3); print int($3) }
+      '
+    )"
+    [ -n "${P2_END_MIB}" ] || { logger -t autopart "failed to get p2 end"; exit 1; }
 
-  LAST_END=$(( START_SECTOR_P2 + END_SECTOR - 1 ))
-  P3_SECTORS=$(( (EXTROOT_MB * 1024 * 1024 + SECTOR_SIZE - 1) / SECTOR_SIZE ))
-  P3_START=$(( LAST_END + 1 ))
-  P3_END=$(( P3_START + P3_SECTORS - 1 ))
-  P4_START=$(( P3_END + 1 ))
+    P3_START_MIB=$((P2_END_MIB + 1))
+    P3_END_MIB=$((P3_START_MIB + P3_SIZE_MIB))
+    P4_START_MIB=$((P3_END_MIB + 1))
 
-  # 写分区表
-  partprobe "$DISK" 2>/dev/null
-  parted -s "$DISK" unit s \
-    "print" \
-    "mkpart primary ext4 ${P3_START}s ${P3_END}s" \
-    "mkpart primary ext4 ${P4_START}s 100%" || exit 0
+    # 创建分区（使用分区名以便 fstab 用 LABEL）
+    parted -s "${DEV}" unit MiB \
+      mkpart EXTROOT ext4 "${P3_START_MIB}" "${P3_END_MIB}" \
+      mkpart DOCKER  ext4 "${P4_START_MIB}" 100%
 
-  partprobe "$DISK"
-  sleep 2
+    partprobe "${DEV}" || true
+    sleep 2
+  else
+    logger -t autopart "p3/p4 already exist, skip creating"
+  fi
 
-  P3="${DISK}p3"; [ -b "$P3" ] || P3="${DISK}3"
-  P4="${DISK}p4"; [ -b "$P4" ] || P4="${DISK}4"
-  [ -b "$P3" ] || exit 0
-  [ -b "$P4" ] || exit 0
+  # 格式化（仅当不是 ext4 或无文件系统时）
+  if ! blkid -t LABEL="EXTROOT" -o device >/dev/null 2>&1; then
+    mkfs.ext4 -F -L EXTROOT "${DEV}p3"
+  fi
+  if ! blkid -t LABEL="DOCKER" -o device >/dev/null 2>&1; then
+    mkfs.ext4 -F -L DOCKER  "${DEV}p4"
+  fi
 
-  # 格式化并打标签
-  mkfs.ext4 -F -L EXTROOT "$P3"
-  mkfs.ext4 -F -L DOCKER  "$P4"
+  # 写 fstab（使用 LABEL，避免设备名变动）
+  mkdir -p /etc/config
+  if ! uci -q show fstab >/dev/null 2>&1; then
+    uci -q set fstab=@global[0]=global || uci -q add fstab global >/dev/null
+  fi
 
-  # 配置 fstab
-  uci -q batch <<-EOF
-    add fstab mount
-    set fstab.@mount[-1].enabled='1'
-    set fstab.@mount[-1].device='LABEL=EXTROOT'
-    set fstab.@mount[-1].target='/overlay'
-    set fstab.@mount[-1].fstype='ext4'
-    set fstab.@mount[-1].options='rw,sync'
-    set fstab.@mount[-1].is_rootfs='1'
+  uci -q batch <<'EOF' || true
+set fstab.@global[0]=global
+set fstab.@global[0].anon_swap='0'
+set fstab.@global[0].anon_mount='0'
+set fstab.@global[0].auto_swap='1'
+set fstab.@global[0].auto_mount='1'
+set fstab.@global[0].delay_root='5'
+set fstab.@global[0].check_fs='1'
+EOF
 
-    add fstab mount
-    set fstab.@mount[-1].enabled='1'
-    set fstab.@mount[-1].device='LABEL=DOCKER'
-    set fstab.@mount[-1].target='/mnt/docker'
-    set fstab.@mount[-1].fstype='ext4'
-    set fstab.@mount[-1].options='defaults'
-  EOF
-  uci commit fstab
-  /etc/init.d/fstab enable
-  /etc/init.d/fstab restart
+  ensure_mount_cfg() {
+    local target="$1" devspec="$2" fstype="$3" opts="$4"
+    # 查是否已有相同 target
+    if ! uci -q show fstab | grep -q "fstab.@mount\[[0-9]\+\].target='${target}'"; then
+      uci -q add fstab mount >/dev/null
+      idx=$(uci -q show fstab | sed -n '$s/.*@mount\[\([0-9]\+\)\].*/\1/p')
+      uci -q set fstab.@mount["$idx"].target="${target}"
+      uci -q set fstab.@mount["$idx"].device="${devspec}"
+      uci -q set fstab.@mount["$idx"].fstype="${fstype}"
+      uci -q set fstab.@mount["$idx"].enabled='1'
+      [ -n "${opts}" ] && uci -q set fstab.@mount["$idx"].options="${opts}"
+    fi
+  }
 
-  # 写 Docker 默认目录
+  ensure_mount_cfg "/overlay"    "LABEL=EXTROOT" "ext4" "rw,noatime,data=ordered"
+  mkdir -p /mnt/docker
+  ensure_mount_cfg "/mnt/docker" "LABEL=DOCKER"  "ext4" "rw,noatime,data=ordered"
+
+  uci -q commit fstab
+
+  # 先尝试挂载（不强制重启）；extroot 通常需要下次重启才能生效
+  block mount || true
+
+  # 写 docker 配置（指向 /mnt/docker；如果没挂上，也无妨，下一次重启后就绪）
   mkdir -p /etc/docker
-  cat > /etc/docker/daemon.json <<'JSON'
+  cat >/etc/docker/daemon.json <<'JSON'
 {
-  "data-root": "/mnt/docker"
+  "data-root": "/mnt/docker",
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "iptables": true,
+  "ip-masq": true,
+  "exec-opts": ["native.cgroupdriver=systemd"]
 }
 JSON
 
-  # 🚫 防止 Docker 抢跑
-  /etc/init.d/dockerd stop 2>/dev/null
-  /etc/init.d/dockerd disable 2>/dev/null
+  # 准备 cron（避免 AdGuardHome 启动脚本 grep 报错）
+  mkdir -p /etc/crontabs
+  : > /etc/crontabs/root
 
-  # 完成标记
-  touch "$FLAG"
-  sync
-  reboot
+  logger -t autopart "done"
 }
