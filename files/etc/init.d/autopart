@@ -1,6 +1,6 @@
 #!/bin/sh /etc/rc.common
 # 首启：创建 p3=20G(ext4, EXTROOT -> /overlay)、p4=余量(ext4, DOCKER -> /mnt/docker)
-# 幂等：若已存在 EXTROOT 标签或标记文件，则不重复执行
+# 幂等：若已存在 EXTROOT 分区或标记文件，则不重复执行
 START=99
 USE_PROCD=1
 FLAG="/etc/.autopart_done"
@@ -22,9 +22,11 @@ base_disk_of() {
 }
 
 start() {
+  # 已完成就退出
   [ -f "$FLAG" ] && exit 0
   blkid | grep -q 'LABEL="EXTROOT"' && exit 0
 
+  # 必须要有 parted 和 mkfs.ext4
   command -v parted >/dev/null 2>&1 || exit 0
   command -v mkfs.ext4 >/dev/null 2>&1 || exit 0
 
@@ -33,8 +35,14 @@ start() {
   DISK="$(base_disk_of "$BOOT_PART")"
   [ -b "$DISK" ] || exit 0
 
+  case "$DISK" in
+    /dev/mmcblk*|/dev/sd*) ;;
+    *) exit 0 ;;
+  esac
+
   EXTROOT_MB=20480  # 20GB
 
+  # 找到 p2 作为参考
   P2="${DISK}p2"; [ -b "$P2" ] || P2="${DISK}2"
   [ -b "$P2" ] || exit 0
 
@@ -50,7 +58,10 @@ start() {
   P3_END=$(( P3_START + P3_SECTORS - 1 ))
   P4_START=$(( P3_END + 1 ))
 
+  # 写分区表
+  partprobe "$DISK" 2>/dev/null
   parted -s "$DISK" unit s \
+    "print" \
     "mkpart primary ext4 ${P3_START}s ${P3_END}s" \
     "mkpart primary ext4 ${P4_START}s 100%" || exit 0
 
@@ -62,9 +73,11 @@ start() {
   [ -b "$P3" ] || exit 0
   [ -b "$P4" ] || exit 0
 
+  # 格式化并打标签
   mkfs.ext4 -F -L EXTROOT "$P3"
   mkfs.ext4 -F -L DOCKER  "$P4"
 
+  # 配置 fstab
   uci -q batch <<-EOF
     add fstab mount
     set fstab.@mount[-1].enabled='1'
@@ -85,6 +98,7 @@ start() {
   /etc/init.d/fstab enable
   /etc/init.d/fstab restart
 
+  # 写 Docker 默认目录
   mkdir -p /etc/docker
   cat > /etc/docker/daemon.json <<'JSON'
 {
@@ -92,6 +106,11 @@ start() {
 }
 JSON
 
+  # 🚫 防止 Docker 抢跑
+  /etc/init.d/dockerd stop 2>/dev/null
+  /etc/init.d/dockerd disable 2>/dev/null
+
+  # 完成标记
   touch "$FLAG"
   sync
   reboot
